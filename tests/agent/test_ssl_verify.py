@@ -614,7 +614,7 @@ def converter(certs):
         barrier.wait()  # all nine misses pass the lookup before any inserts
     elif certs is lists[9]:
         paused.set()
-        gate.wait(20)
+        gate.wait()  # opened only by the test, after it checks the lock
     return real(certs)
 _macos._der_certs_to_cf_cert_array = converter
 from agent import ssl_verify
@@ -635,16 +635,18 @@ mode[0] = 'pause'
 hit_list = next(l for l in lists[:9] if hashlib.sha256(b'\\0'.join(l)).digest() in cache)
 miss = threading.Thread(target=lambda: cf.CFRelease(convert(lists[9])))
 miss.start()
-assert paused.wait(20)
-hits = []
-hit = threading.Thread(target=lambda: hits.append(convert(hit_list)))
-hit.start()
-hit.join(10)
-gate.set()
-miss.join(20)
-hit.join(20)
-assert hits, 'a cached hit waited behind a full-cache conversion'
-cf.CFRelease(hits[0])
+try:
+    assert paused.wait(20)
+    free = ssl_verify._anchor_arrays_lock.acquire(blocking=False)
+    if free:
+        ssl_verify._anchor_arrays_lock.release()
+finally:
+    gate.set()
+    miss.join(20)
+assert free, 'a full-cache conversion held the lock that cached hits need'
+hit = convert(hit_list)
+assert cf.CFGetRetainCount(hit) == 2
+cf.CFRelease(hit)
 assert len(cache) == ssl_verify._ANCHOR_CACHE_MAX_ENTRIES
 """
     child = subprocess.run(
