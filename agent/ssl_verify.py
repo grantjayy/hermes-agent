@@ -52,6 +52,7 @@ def install_truststore() -> bool:
         truststore.inject_into_ssl()
         _installed = True
         logger.debug("TLS trust: platform store (truststore)")
+        _cache_macos_anchor_arrays()
     except Exception as exc:
         _installed = False
         logger.warning(
@@ -61,6 +62,64 @@ def install_truststore() -> bool:
             exc,
         )
     return _installed
+
+
+# truststore's macOS backend turns the context's whole CA list (128 roots for
+# ``ssl.create_default_context()``) into a fresh CFArray on EVERY handshake: a
+# few hundred ctypes calls, each of which drops and retakes the GIL. In a busy
+# process each retake waits behind other threads, so one handshake on an
+# asyncio loop can hold that loop for tens of seconds. The list only changes
+# when a context loads new CAs, so build each large list once and share it.
+_ANCHOR_CACHE_MIN_CERTS = 16  # peer chains (2-4 certs) stay uncached
+_ANCHOR_CACHE_MAX_ENTRIES = 8  # distinct CA sets per process; full = no caching
+_anchor_arrays: dict[bytes, Any] = {}
+_anchor_arrays_lock = threading.Lock()
+
+
+def _cache_macos_anchor_arrays() -> None:
+    """Memoize truststore's per-handshake CA conversion on macOS. Never raises."""
+    try:
+        import ctypes
+        import hashlib
+
+        from truststore import _api, _macos
+
+        if getattr(_api._verify_peercerts_impl, "__module__", None) != "truststore._macos":
+            return  # Windows/OpenSSL backend
+        convert = _macos._der_certs_to_cf_cert_array
+        if getattr(convert, "_hermes_anchor_cache", False):
+            return
+        retain = _macos.CoreFoundation.CFRetain
+        retain.argtypes = [ctypes.c_void_p]
+        retain.restype = ctypes.c_void_p
+        release = _macos.CoreFoundation.CFRelease
+    except Exception:
+        logger.debug("truststore macOS anchor cache not installed", exc_info=True)
+        return
+
+    def cached_convert(certs: list[bytes]) -> Any:
+        if len(certs) < _ANCHOR_CACHE_MIN_CERTS:
+            return convert(certs)
+        key = hashlib.sha256(b"\0".join(certs)).digest()
+        with _anchor_arrays_lock:
+            array = _anchor_arrays.get(key)
+            if array is not None:
+                retain(array)  # the caller CFReleases its reference; ours stays
+                return array
+            if len(_anchor_arrays) >= _ANCHOR_CACHE_MAX_ENTRIES:
+                return convert(certs)
+        array = convert(certs)
+        with _anchor_arrays_lock:
+            if key in _anchor_arrays:  # another thread built it meanwhile
+                release(array)
+                array = _anchor_arrays[key]
+            else:
+                _anchor_arrays[key] = array
+            retain(array)
+        return array
+
+    cached_convert._hermes_anchor_cache = True  # type: ignore[attr-defined]
+    _macos._der_certs_to_cf_cert_array = cached_convert
 
 
 def _coerce_insecure(ssl_verify: Any) -> bool:

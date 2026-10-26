@@ -528,3 +528,65 @@ def test_platform_store_bundle_survives_an_unwritable_home(tmp_path, monkeypatch
     monkeypatch.setattr(ssl_verify, "_PLATFORM_STORE_BUNDLE", None)
     monkeypatch.setattr(ssl_verify, "_stdlib_ssl_context_class", lambda: _StoreWithACert)
     assert ssl_verify._platform_store_bundle() is None
+
+
+@pytest.mark.platforms("macos")
+def test_macos_handshakes_convert_a_ca_list_once(tmp_path):
+    """truststore's macOS backend rebuilds a context's CA list as a CFArray on every
+    handshake: hundreds of GIL-releasing ctypes calls, which a busy process turns
+    into multi-second event-loop stalls. Repeat handshakes must reuse one array,
+    still verify, and keep CoreFoundation reference counts balanced."""
+    import subprocess
+    import sys
+
+    with _private_https_server(tmp_path) as (server, ca):
+        script = """
+import ctypes, socket, ssl, sys
+import certifi
+from truststore import _macos
+real = _macos._der_certs_to_cf_cert_array
+conversions = []
+def counting(certs):
+    if len(certs) >= 16:
+        conversions.append(len(certs))
+    return real(certs)
+_macos._der_certs_to_cf_cert_array = counting
+from agent.ssl_verify import install_truststore
+assert install_truststore()
+port, ca = int(sys.argv[1]), sys.argv[2]
+
+def handshake(ctx):
+    with socket.create_connection(('127.0.0.1', port), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname='127.0.0.1'):
+            pass
+
+trusted = ssl.create_default_context(cafile=certifi.where())
+trusted.load_verify_locations(cafile=ca)
+for _ in range(5):
+    handshake(trusted)
+assert conversions == [conversions[0]], conversions
+
+cf = _macos.CoreFoundation
+cf.CFGetRetainCount.argtypes = [ctypes.c_void_p]
+cf.CFGetRetainCount.restype = ctypes.c_long
+arrays = list(__import__('agent.ssl_verify', fromlist=['x'])._anchor_arrays.values())
+assert len(arrays) == 1, arrays
+before = cf.CFGetRetainCount(arrays[0])
+for _ in range(5):
+    handshake(trusted)
+assert cf.CFGetRetainCount(arrays[0]) == before
+
+untrusted = ssl.create_default_context(cafile=certifi.where())
+try:
+    handshake(untrusted)
+except ssl.SSLCertVerificationError:
+    pass
+else:
+    raise AssertionError('CA list without the private CA trusted it')
+assert len(conversions) == 2, conversions
+"""
+        child = subprocess.run(
+            [sys.executable, "-c", script, str(server.server_port), str(ca)],
+            env=_child_env(tmp_path), capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
