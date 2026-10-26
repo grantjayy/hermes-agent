@@ -106,13 +106,17 @@ def _cache_macos_anchor_arrays() -> None:
             if array is not None:
                 retain(array)  # the caller CFReleases its reference; ours stays
                 return array
-            if len(_anchor_arrays) >= _ANCHOR_CACHE_MAX_ENTRIES:
-                return convert(certs)
-        array = convert(certs)
+            full = len(_anchor_arrays) >= _ANCHOR_CACHE_MAX_ENTRIES
+        array = convert(certs)  # never under the lock: cached hits must not wait
+        if full:
+            return array
         with _anchor_arrays_lock:
-            if key in _anchor_arrays:  # another thread built it meanwhile
+            cached = _anchor_arrays.get(key)
+            if cached is not None:  # another thread built it meanwhile
                 release(array)
-                array = _anchor_arrays[key]
+                array = cached
+            elif len(_anchor_arrays) >= _ANCHOR_CACHE_MAX_ENTRIES:
+                return array  # filled meanwhile: the caller owns the only reference
             else:
                 _anchor_arrays[key] = array
             retain(array)

@@ -590,3 +590,65 @@ assert len(conversions) == 2, conversions
             env=_child_env(tmp_path), capture_output=True, text=True, timeout=60, check=False,
         )
         assert child.returncode == 0, child.stdout + child.stderr
+
+
+@pytest.mark.platforms("macos")
+def test_macos_anchor_cache_stays_bounded_and_never_blocks_hits(tmp_path):
+    """Concurrent misses must not grow the cache past its bound, and a slow
+    uncached conversion must not hold the lock that cached handshakes need."""
+    import subprocess
+    import sys
+
+    script = """
+import ctypes, hashlib, ssl, threading
+from concurrent.futures import ThreadPoolExecutor
+import certifi
+from truststore import _macos
+roots = ssl.create_default_context(cafile=certifi.where()).get_ca_certs(binary_form=True)
+lists = [roots[i:i + 16] for i in range(10)]
+real = _macos._der_certs_to_cf_cert_array
+barrier, paused, gate = threading.Barrier(9, timeout=20), threading.Event(), threading.Event()
+mode = ['race']
+def converter(certs):
+    if mode[0] == 'race':
+        barrier.wait()  # all nine misses pass the lookup before any inserts
+    elif certs is lists[9]:
+        paused.set()
+        gate.wait(20)
+    return real(certs)
+_macos._der_certs_to_cf_cert_array = converter
+from agent import ssl_verify
+assert ssl_verify.install_truststore()
+convert = _macos._der_certs_to_cf_cert_array
+cf = _macos.CoreFoundation
+cf.CFGetRetainCount.argtypes = [ctypes.c_void_p]
+cf.CFGetRetainCount.restype = ctypes.c_long
+cache = ssl_verify._anchor_arrays
+
+with ThreadPoolExecutor(9) as pool:
+    for array in list(pool.map(convert, lists[:9])):
+        cf.CFRelease(array)
+assert len(cache) == ssl_verify._ANCHOR_CACHE_MAX_ENTRIES, len(cache)
+assert [cf.CFGetRetainCount(a) for a in cache.values()] == [1] * len(cache)
+
+mode[0] = 'pause'
+hit_list = next(l for l in lists[:9] if hashlib.sha256(b'\\0'.join(l)).digest() in cache)
+miss = threading.Thread(target=lambda: cf.CFRelease(convert(lists[9])))
+miss.start()
+assert paused.wait(20)
+hits = []
+hit = threading.Thread(target=lambda: hits.append(convert(hit_list)))
+hit.start()
+hit.join(10)
+gate.set()
+miss.join(20)
+hit.join(20)
+assert hits, 'a cached hit waited behind a full-cache conversion'
+cf.CFRelease(hits[0])
+assert len(cache) == ssl_verify._ANCHOR_CACHE_MAX_ENTRIES
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", script],
+        env=_child_env(tmp_path), capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
