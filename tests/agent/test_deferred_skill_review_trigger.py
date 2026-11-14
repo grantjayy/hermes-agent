@@ -76,7 +76,8 @@ def test_skill_review_trigger_follows_session_reachability(runtime, config_yaml,
         with patch("agent.codex_runtime._record_codex_app_server_compaction"), \
                 patch("agent.codex_runtime._record_codex_app_server_usage", return_value={}):
             _finish_codex_turn(agent, turn, [{"role": "assistant", "content": "done"}],
-                               original_user_message="hello", should_review_memory=False)
+                               original_user_message="hello", should_review_memory=False,
+                               final_response="done")
 
     if expect_review:
         agent._spawn_background_review.assert_called_once()
